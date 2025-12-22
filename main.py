@@ -1,23 +1,23 @@
 import os
-import time
-from datetime import datetime
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-def log(msg: str):
-    print(f"[{datetime.utcnow().isoformat()}Z] {msg}", flush=True)
+# Telegram bilgilerini Railway'den al
+TG_TOKEN = os.getenv("TG_TOKEN")
+
+# /start komutu
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Scalp AI botu çalışıyor!")
+
+def main():
+    print("🤖 Bot başlatılıyor...")
+
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+
+    print("📡 Telegram dinleniyor...")
+    app.run_polling()   # ⚠️ EN ÖNEMLİ SATIR
 
 if __name__ == "__main__":
-    log("SCALP-AI PAPER MODE STARTED ✅")
-    log(f"PYTHON={os.getenv('PYTHON_VERSION','unknown')}")
-
-    while True:
-        log("Bot çalışıyor... (paper) ✅")
-        time.sleep(60)
-import signal
-import sys
-
-def shutdown(sig, frame):
-    print("Bot durduruluyor...", flush=True)
-    sys.exit(0)
-
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
+    main()
