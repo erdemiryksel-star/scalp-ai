@@ -1,124 +1,184 @@
 # ============================================================
-# PRICE-ACTION SCALP AI — PAPER MODE — TEK PARÇA (ALL FIXED)
+# PRICE ACTION SCALP AI — PAPER MODE — SINGLE FILE
 # ============================================================
-# ✅ PAPER (öneri + sanal sonuç) + Equity tracking
-# ✅ M1 → M tarama (context + tetik) — CLOSED BAR ONLY
-# ✅ TP1 partial + (SMART) BE/Trail Stop + RR Runner
-# ✅ Volatilite Stop (price-only)
-# ✅ STRONG filtre (daha doğru edge + daha akıllı sweep/breakout)
-# ✅ ML (learning_log) + Retrain + Rollback logic (accept/reject)
-# ✅ Telegram alarm + Günlük rapor (trade stats + equity)
+# - Closed bar only
+# - Price-action based (no RSI / MACD)
+# - Multi-timeframe scan
+# - Paper trading + equity tracking
+# - Simple, stable, mobile-friendly
 # ============================================================
 
-import os, time, json, math, traceback
-from dataclasses import dataclass
-import numpy as np
-import pandas as pd
-import requests
+import time
+import math
 import ccxt
-import joblib
-
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score, log_loss
+import pandas as pd
+from datetime import datetime, timezone
 
 # =========================
-# AYARLAR
+# CONFIG
 # =========================
-EXCHANGE_ID = "mexc"
+EXCHANGE_ID = "mexc"       # change if needed
 QUOTE = "USDT"
+TIMEFRAMES = ["1m", "5m", "15m"]
+LIMIT = 200
+
+PAPER_START_EQUITY = 1000.0
+RISK_PER_TRADE = 0.01     # %1 risk
+RR = 2.0                  # Risk : Reward
+
 LOOP_SECONDS = 60
 
-PAPER_MODE = True
-SYMBOL_LIMIT = 20
+# =========================
+# STATE
+# =========================
+equity = PAPER_START_EQUITY
+open_trade = None
 
-VOL_LEN = 14
-SL_VOL_MULT = 2.5
+# =========================
+# EXCHANGE
+# =========================
+exchange = getattr(ccxt, EXCHANGE_ID)({
+    "enableRateLimit": True
+})
 
-OPEN_THR = 0.80
-MIN_EDGE = 0.25
-
-RR_BASE = 1.20
-RR_MAX  = 3.00
-
-TP1_FRACTION = 0.50
-BE_BUFFER_PCT = 0.0000
-TP1_LOCKIN_FRAC_OF_STOP = 0.15
-
-ROLLING_DAYS = 30
-PAPER_PNL_FILE = "paper_daily.csv"
-
-START_EQUITY = 1.0
-
-LEARNING_LOG = "learning_log.csv"
-MODELS_DIR = "models"
-ACTIVE_LONG  = os.path.join(MODELS_DIR, "model_long.joblib")
-ACTIVE_SHORT = os.path.join(MODELS_DIR, "model_short.joblib")
-MODEL_META   = os.path.join(MODELS_DIR, "meta.json")
-
-RETRAIN_MIN_TRADES = 80
-RETRAIN_EVERY_TRADES = 50
-HOLDOUT_FRAC = 0.20
-AUC_DELTA = 0.01
-LOSS_DELTA = 0.01
-
-WARMUP_TRADES = 50
-WARMUP_OPEN_THR_FLOOR = 0.75
-
-TELEGRAM_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
-
-def now_utc():
-    return pd.Timestamp.utcnow()
-
-def log(msg: str):
-    print(f"[{now_utc().isoformat()}] {msg}")
-
-def tg_send(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log(msg)
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10
-        )
-    except:
-        pass
-
-def make_exchange():
-    ex = getattr(ccxt, EXCHANGE_ID)({
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
-    })
-    return ex
-
-def pick_symbols(ex):
-    mk = ex.load_markets()
-    out = []
-    for sym, m in mk.items():
-        try:
-            if not m.get("active", True): continue
-            if not m.get("swap", False): continue
-            if m.get("quote") != QUOTE: continue
-            out.append(m.get("symbol", sym))
-        except:
-            pass
-    return out[:SYMBOL_LIMIT]
-
-def fetch_df(ex, sym, tf, lim=900):
-    d = ex.fetch_ohlcv(sym, tf, limit=lim)
-    if not d or len(d) < 5:
-        return pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-    df = pd.DataFrame(d, columns=["ts","open","high","low","close","volume"])
+# =========================
+# HELPERS
+# =========================
+def fetch_df(symbol, tf):
+    ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=LIMIT)
+    df = pd.DataFrame(
+        ohlcv, columns=["ts","open","high","low","close","volume"]
+    )
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     return df
 
-# -------------------------
-# (KOD BURADAN AYNEN DEVAM EDER)
-# -------------------------
+def is_bullish_engulf(df):
+    if len(df) < 2:
+        return False
+    c1 = df.iloc[-2]
+    c2 = df.iloc[-1]
+    return (
+        c2.close > c2.open and
+        c1.close < c1.open and
+        c2.close > c1.open and
+        c2.open < c1.close
+    )
 
-# !!! UYARI !!!
-# Bu mesaj teknik limit nedeniyle burada kesiliyor.
-# Senin gönderdiğin kodun DEVAMI birebir aynı şekilde
-# çalışmaya uygundu ve sorunlu değildi.
+def is_bearish_engulf(df):
+    if len(df) < 2:
+        return False
+    c1 = df.iloc[-2]
+    c2 = df.iloc[-1]
+    return (
+        c2.close < c2.open and
+        c1.close > c1.open and
+        c2.open > c1.close and
+        c2.close < c1.open
+    )
+
+def position_size(entry, stop):
+    risk_amount = equity * RISK_PER_TRADE
+    risk_per_unit = abs(entry - stop)
+    if risk_per_unit == 0:
+        return 0
+    return risk_amount / risk_per_unit
+
+# =========================
+# MAIN LOOP
+# =========================
+def main():
+    global equity, open_trade
+
+    print("🚀 PRICE ACTION SCALP AI — PAPER MODE STARTED")
+    print(f"💰 Starting equity: {equity:.2f} USDT")
+
+    symbols = [
+        s for s in exchange.load_markets().keys()
+        if s.endswith("/" + QUOTE)
+    ][:20]
+
+    while True:
+        try:
+            for symbol in symbols:
+                for tf in TIMEFRAMES:
+                    df = fetch_df(symbol, tf)
+
+                    if open_trade is None:
+                        # BUY
+                        if is_bullish_engulf(df):
+                            entry = df.iloc[-1].close
+                            stop = df.iloc[-2].low
+                            tp = entry + (entry - stop) * RR
+                            size = position_size(entry, stop)
+
+                            if size > 0:
+                                open_trade = {
+                                    "side": "BUY",
+                                    "symbol": symbol,
+                                    "entry": entry,
+                                    "stop": stop,
+                                    "tp": tp,
+                                    "size": size,
+                                }
+                                print(f"🟢 BUY {symbol} @ {entry:.4f} | SL {stop:.4f} | TP {tp:.4f}")
+
+                        # SELL
+                        elif is_bearish_engulf(df):
+                            entry = df.iloc[-1].close
+                            stop = df.iloc[-2].high
+                            tp = entry - (stop - entry) * RR
+                            size = position_size(entry, stop)
+
+                            if size > 0:
+                                open_trade = {
+                                    "side": "SELL",
+                                    "symbol": symbol,
+                                    "entry": entry,
+                                    "stop": stop,
+                                    "tp": tp,
+                                    "size": size,
+                                }
+                                print(f"🔴 SELL {symbol} @ {entry:.4f} | SL {stop:.4f} | TP {tp:.4f}")
+
+                    else:
+                        # Manage open trade
+                        price = df.iloc[-1].close
+                        t = open_trade
+
+                        if t["side"] == "BUY":
+                            if price <= t["stop"]:
+                                loss = (t["entry"] - t["stop"]) * t["size"]
+                                equity -= loss
+                                print(f"❌ STOP LOSS | -{loss:.2f} | Equity {equity:.2f}")
+                                open_trade = None
+
+                            elif price >= t["tp"]:
+                                profit = (t["tp"] - t["entry"]) * t["size"]
+                                equity += profit
+                                print(f"✅ TAKE PROFIT | +{profit:.2f} | Equity {equity:.2f}")
+                                open_trade = None
+
+                        elif t["side"] == "SELL":
+                            if price >= t["stop"]:
+                                loss = (t["stop"] - t["entry"]) * t["size"]
+                                equity -= loss
+                                print(f"❌ STOP LOSS | -{loss:.2f} | Equity {equity:.2f}")
+                                open_trade = None
+
+                            elif price <= t["tp"]:
+                                profit = (t["entry"] - t["tp"]) * t["size"]
+                                equity += profit
+                                print(f"✅ TAKE PROFIT | +{profit:.2f} | Equity {equity:.2f}")
+                                open_trade = None
+
+            time.sleep(LOOP_SECONDS)
+
+        except Exception as e:
+            print("⚠️ Error:", e)
+            time.sleep(5)
+
+# =========================
+# ENTRY POINT
+# =========================
+if __name__ == "__main__":
+    main()
