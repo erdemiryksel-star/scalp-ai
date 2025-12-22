@@ -12,3 +12,12 @@ if __name__ == "__main__":
     while True:
         log("Bot çalışıyor... (paper) ✅")
         time.sleep(60)
+import signal
+import sys
+
+def shutdown(sig, frame):
+    print("Bot durduruluyor...", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
